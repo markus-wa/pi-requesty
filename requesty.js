@@ -146,8 +146,20 @@ async function discoverModels({ baseUrl, apiKey, previousModels = [] }) {
     });
 }
 
+/**
+ * Convert a catalog price from per-token to the per-million-token unit
+ * `models.json` uses.
+ *
+ * The catalog quotes per-token rates, so the scaling is a plain `* 1e6`, but
+ * binary floats make that product noisy: `2.3e-7 * 1e6` is
+ * `0.22999999999999998`. Rounding to 12 significant digits keeps every price
+ * the catalog publishes and drops the noise, which only shows up around the
+ * 16th digit.
+ */
+const PRICE_SIGNIFICANT_DIGITS = 12;
+
 function pricePerMillionTokens(value) {
-  return (value ?? 0) * 1_000_000;
+  return Number(((value ?? 0) * 1_000_000).toPrecision(PRICE_SIGNIFICANT_DIGITS));
 }
 
 function writeModelsJson(data) {

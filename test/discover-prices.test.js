@@ -191,6 +191,47 @@ describe("catalog price fallback", () => {
     );
   });
 
+  it("rounds float noise out of the per-token to per-million conversion", async () => {
+    activeStub = stubFetch([
+      {
+        id: "melious/deepseek-v4.1-flash",
+        input_price: 2.3e-7,
+        output_price: 1.14e-6,
+        cached_price: 2e-8,
+      },
+    ]);
+    writeModelsJson(modelsJsonWith({ id: "melious/deepseek-v4.1-flash" }));
+
+    const pi = createPi();
+    await requestyExtension(pi);
+
+    // Exact equality on purpose: `* 1e6` alone stored 0.22999999999999998 for
+    // input and 1.1400000000000001 for output.
+    assert.deepEqual(costOf(pi, "melious/deepseek-v4.1-flash"), {
+      input: 0.23,
+      output: 1.14,
+      cacheRead: 0.02,
+      cacheWrite: 0,
+    });
+  });
+
+  it("keeps the full precision the catalog publishes", async () => {
+    activeStub = stubFetch([
+      { id: "high-precision/model", input_price: 9.1663e-8, cached_price: 4.41e-9 },
+    ]);
+    writeModelsJson(modelsJsonWith({ id: "high-precision/model" }));
+
+    const pi = createPi();
+    await requestyExtension(pi);
+
+    assert.deepEqual(costOf(pi, "high-precision/model"), {
+      input: 0.091663,
+      output: 0,
+      cacheRead: 0.00441,
+      cacheWrite: 0,
+    });
+  });
+
   it("keeps the preserved price when the sync command rewrites models.json", async () => {
     activeStub = stubFetch([{ id: "policy/deepseek-v4.1-flash" }]);
     writeModelsJson(
