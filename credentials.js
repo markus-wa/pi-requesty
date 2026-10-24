@@ -11,9 +11,8 @@
  * {@link resolveConfigValue}) and a resolved key is only ever held in memory: it
  * is never written back to `models.json`.
  */
+import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -23,21 +22,13 @@ const COMMAND_TIMEOUT_MS = 10_000;
 /** Shell-command results, cached for the process lifetime. */
 const commandResultCache = new Map();
 
-/** Pi's agent directory, honoring `PI_CODING_AGENT_DIR`. */
-export function agentDir() {
-  const configured = process.env.PI_CODING_AGENT_DIR;
-  if (typeof configured === "string" && configured.length > 0) {
-    return configured;
-  }
-  return path.join(os.homedir(), ".pi", "agent");
-}
-
+/** `models.json` and `auth.json`, at the agent directory pi reports. */
 export function authJsonPath() {
-  return path.join(agentDir(), "auth.json");
+  return path.join(getAgentDir(), "auth.json");
 }
 
 export function modelsJsonPath() {
-  return path.join(agentDir(), "models.json");
+  return path.join(getAgentDir(), "models.json");
 }
 
 /** Whether a config value is a `!command` reference. */
@@ -64,17 +55,16 @@ export function resolveConfigValue(config, env) {
 }
 
 /**
- * Read the stored `api_key` credential for a provider from `auth.json`.
- *
- * Read directly rather than through Pi's exported `readStoredCredential`: that is
- * the same plain read of the same file, with no value resolution, so importing it
- * would add a second path that a test here can never exercise.
+ * Read the stored `api_key` credential for a provider, through pi's own
+ * `readStoredCredential`: one synchronous read of `auth.json` that leaves lock
+ * handling, BOM stripping and the file's shape to pi, and deliberately does not
+ * resolve configured values -- that is this module's job, below.
  */
 export function readStoredApiKey(providerId, options = {}) {
   const authPath = options.authPath ?? authJsonPath();
-  const credential = readCredential(providerId, authPath);
+  const credential = readStoredCredential(providerId, authPath);
 
-  if (!credential) {
+  if (!credential || typeof credential !== "object") {
     return { reason: `no "${providerId}" credential in ${authPath}` };
   }
   if (credential.type !== "api_key") {
@@ -94,24 +84,6 @@ export function readStoredApiKey(providerId, options = {}) {
   }
 
   return { key, source: authPath };
-}
-
-/** `auth.json` holds one credential per provider id. */
-function readCredential(providerId, authPath) {
-  try {
-    const data = JSON.parse(stripBom(fs.readFileSync(authPath, "utf-8")));
-    if (!data || typeof data !== "object") {
-      return undefined;
-    }
-    const credential = data[providerId];
-    return credential && typeof credential === "object" ? credential : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function stripBom(text) {
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
 /** Execute a `!command` value, caching the result for the process lifetime. */

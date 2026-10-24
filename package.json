@@ -7,7 +7,7 @@
   "keywords": ["pi-package", "pi", "pi-coding-agent", "pi-extensions", "requesty", "openai-compatible", "models"],
   "license": "MIT",
   "scripts": {
-    "test": "node --test"
+    "test": "node --import ./test-support/pi-stub.mjs --test"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
