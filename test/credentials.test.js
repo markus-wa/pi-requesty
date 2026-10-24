@@ -59,11 +59,14 @@ function createContext() {
 }
 
 /** Stub `fetch`, recording the discovery request instead of making it. */
-function stubFetch(models = [{ id: "policy/deepseek-v4.1-flash" }]) {
+function stubFetch(models = [{ id: "policy/deepseek-v4.1-flash" }], failure) {
   const calls = [];
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
-    calls.push({ url, authorization: init?.headers?.Authorization });
+    calls.push({ url, authorization: init?.headers?.Authorization, signal: init?.signal });
+    if (failure) {
+      throw failure;
+    }
     return {
       ok: true,
       status: 200,
@@ -291,6 +294,54 @@ describe("startup discovery", () => {
 
     assert.match(warnings.warnings.join("\n"), /HTTP 401/);
   });
+
+  it("bounds the discovery request so an unresponsive endpoint cannot block startup", async () => {
+    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
+    const fetchStub = stubFetch();
+
+    try {
+      await requestyExtension(createPi());
+    } finally {
+      fetchStub.restore();
+    }
+
+    assert.equal(fetchStub.calls[0].signal instanceof AbortSignal, true);
+  });
+
+  it("reports a discovery timeout instead of hanging", async () => {
+    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
+    const timeout = Object.assign(new Error("The operation was aborted due to timeout"), {
+      name: "TimeoutError",
+    });
+    const fetchStub = stubFetch(undefined, timeout);
+    const warnings = captureWarnings();
+
+    try {
+      await requestyExtension(createPi());
+    } finally {
+      fetchStub.restore();
+      warnings.restore();
+    }
+
+    assert.match(warnings.warnings.join("\n"), /no response from https:\/\/router\.requesty\.ai\/v1\/models within 10000ms/);
+  });
+
+  it("refuses to proceed past a malformed models.json", async () => {
+    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
+    writeModelsJson({ providers: "not-an-object" });
+    const fetchStub = stubFetch();
+    const warnings = captureWarnings();
+
+    try {
+      await requestyExtension(createPi());
+    } finally {
+      fetchStub.restore();
+      warnings.restore();
+    }
+
+    assert.equal(fetchStub.calls.length, 0);
+    assert.match(warnings.warnings.join("\n"), /does not define providers as an object/);
+  });
 });
 
 describe("/requesty-models-sync", () => {
@@ -308,6 +359,29 @@ describe("/requesty-models-sync", () => {
       warnings.restore();
     }
   }
+
+  it("leaves a malformed models.json untouched", async () => {
+    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
+    writeModelsJson({ providers: [] });
+    const before = fs.readFileSync(MODELS_PATH, "utf8");
+
+    const { context } = await runCommand();
+
+    assert.equal(fs.readFileSync(MODELS_PATH, "utf8"), before);
+    assert.equal(context.notifications.at(-1).level, "error");
+    assert.match(context.notifications.at(-1).message, /does not define providers as an object/);
+  });
+
+  it("rejects a provider entry that is not an object", async () => {
+    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
+    writeModelsJson({ providers: { requesty: "nope" } });
+    const before = fs.readFileSync(MODELS_PATH, "utf8");
+
+    const { context } = await runCommand();
+
+    assert.equal(fs.readFileSync(MODELS_PATH, "utf8"), before);
+    assert.match(context.notifications.at(-1).message, /providers\.requesty in .* is not an object/);
+  });
 
   it("writes discovered models without persisting a keyring key", async () => {
     writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });

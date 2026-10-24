@@ -8,6 +8,7 @@ const DEFAULT_BASE_URL = "https://router.requesty.ai/v1";
 const DEFAULT_NAME = "Requesty";
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
+const DISCOVERY_TIMEOUT_MS = 10_000;
 
 function normalizeBaseUrl(baseUrl) {
   return baseUrl.replace(/\/+$/, "");
@@ -17,7 +18,9 @@ function normalizeBaseUrl(baseUrl) {
  * Read models.json.
  *
  * A missing file is not an error: a stored `auth.json` credential is enough to
- * discover models, and the write path creates the provider entry if needed.
+ * discover models, and the write path creates the provider entry if needed. A
+ * malformed one still is: nothing here may quietly replace configuration it did
+ * not understand, because `/requesty-models-sync` writes this file back.
  */
 function readModelsJson() {
   const modelsPath = modelsJsonPath();
@@ -26,8 +29,13 @@ function readModelsJson() {
   }
 
   const data = JSON.parse(fs.readFileSync(modelsPath, "utf8"));
-  if (!data.providers || typeof data.providers !== "object") {
-    data.providers = {};
+  if (!data.providers || typeof data.providers !== "object" || Array.isArray(data.providers)) {
+    throw new Error(`${modelsPath} does not define providers as an object`);
+  }
+
+  const configured = data.providers[PROVIDER];
+  if (configured !== undefined && (typeof configured !== "object" || configured === null || Array.isArray(configured))) {
+    throw new Error(`providers.${PROVIDER} in ${modelsPath} is not an object`);
   }
 
   return data;
@@ -66,8 +74,7 @@ async function resolveRequestyKey(provider, options = {}) {
  */
 async function getRequestyConfig(options = {}) {
   const data = readModelsJson();
-  const configured = data.providers[PROVIDER];
-  const provider = configured && typeof configured === "object" ? configured : {};
+  const provider = data.providers[PROVIDER] ?? {};
 
   const name = typeof provider.name === "string" && provider.name.length > 0 ? provider.name : DEFAULT_NAME;
 
@@ -87,9 +94,22 @@ async function getRequestyConfig(options = {}) {
 }
 
 async function discoverModels({ baseUrl, apiKey }) {
-  const response = await fetch(`${baseUrl}/models`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
+  let response;
+
+  try {
+    // Bounded on purpose: this runs while pi is still starting up, and pi awaits
+    // the extension while loading it, so an endpoint that accepts and never
+    // answers would otherwise keep the TUI from ever appearing.
+    response = await fetch(`${baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new Error(`no response from ${baseUrl}/models within ${DISCOVERY_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  }
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} ${response.statusText}`);

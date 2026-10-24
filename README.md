@@ -26,10 +26,16 @@ pi -e ./pi-requesty
 
 ## Configuration
 
-The extension resolves the `requesty` key exactly like pi does, in this order:
+The extension resolves the `requesty` key from the same two sources pi falls back
+through, in this order:
 
 1. a stored `api_key` credential in the agent directory's `auth.json`
 2. `providers.requesty.apiKey` in `models.json`
+
+(A runtime `--api-key` is not consulted: model discovery calls `<baseUrl>/models`
+directly, outside pi's request pipeline. A stored credential that cannot be
+resolved — a failing command, an unset variable — falls through to `models.json`
+rather than failing, which is friendlier than pi's own behaviour for inference.)
 
 Both accept a literal value, a `$VARIABLE` reference, or a `!command` that prints
 the key — so the key can stay in your secret manager:
@@ -63,7 +69,8 @@ Example using a literal key instead:
 ```
 
 On startup, the extension fetches `<baseUrl>/models` using the resolved key as the
-bearer token and registers discovered models with pi. Without a credential
+bearer token and registers discovered models with pi. The request is bounded by a
+10s timeout, because it runs before pi finishes loading. Without a credential
 discovery is skipped silently: pi resolves credentials for inference itself, and
 the models already listed in `models.json` keep working. The key is never written
 to `models.json`.
