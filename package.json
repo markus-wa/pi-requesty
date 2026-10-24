@@ -6,6 +6,9 @@
   "main": "requesty.js",
   "keywords": ["pi-package", "pi", "pi-coding-agent", "pi-extensions", "requesty", "openai-compatible", "models"],
   "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
@@ -14,6 +17,7 @@
   },
   "files": [
     "requesty.js",
+    "credentials.js",
     "README.md"
   ]
 }
