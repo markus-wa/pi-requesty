@@ -1,32 +1,15 @@
 /**
  * Credential resolution for the Requesty extension.
  *
- * Pi resolves a provider's credentials itself for inference: a runtime
- * `--api-key`, then a stored credential in `auth.json`, then
- * `providers.<id>.apiKey` in `models.json`, then environment variables. Model
- * discovery sits outside that pipeline — it calls `<baseUrl>/models` directly —
- * so it needs the same key up front, and it must understand the same value
- * syntax, including a secret-manager command:
+ * Model discovery calls `<baseUrl>/models` directly, outside pi's request
+ * pipeline, so it needs the provider key itself — including a key that lives in a
+ * secret manager:
  *
- *   {
- *     "requesty": {
- *       "type": "api_key",
- *       "key": "!secret-tool lookup requesty api-key"
- *     }
- *   }
+ *   { "requesty": { "type": "api_key", "key": "!secret-tool lookup requesty api-key" } }
  *
- * This module mirrors Pi's `resolveConfigValue` semantics so a value means the
- * same thing here as it does for inference requests:
- *
- * - a leading `!` runs the rest as a shell command and uses its trimmed stdout
- *   (cached for the lifetime of the process, 10s timeout, `undefined` on failure)
- * - `$NAME` / `${NAME}` interpolate environment variables, and a value naming an
- *   unset variable resolves to `undefined` rather than a partial string
- * - `$$` and `$!` escape a literal `$` and `!`
- * - anything else is a literal
- *
- * A resolved key is only ever held in memory: it is never written back to
- * `models.json`.
+ * Values therefore follow pi's `resolveConfigValue` semantics (see
+ * {@link resolveConfigValue}) and a resolved key is only ever held in memory: it
+ * is never written back to `models.json`.
  */
 import { execSync } from "node:child_process";
 import fs from "node:fs";
@@ -68,11 +51,10 @@ export function clearConfigValueCache() {
 }
 
 /**
- * Resolve an API key or header value to its actual value.
- *
- * Returns `undefined` when a command fails or an interpolated variable is unset,
- * matching Pi: an unresolvable value is treated as "not configured" rather than
- * as an empty credential.
+ * Resolve an API key or header value to its actual value: a `!command` (trimmed
+ * stdout, cached for the process, 10s timeout, `undefined` on failure), a value
+ * with `$NAME`/`${NAME}` interpolated (`undefined` if a variable is unset, with
+ * `$$`/`$!` escaping a literal `$`/`!`), or a literal.
  */
 export function resolveConfigValue(config, env) {
   if (typeof config !== "string" || config.length === 0) {
@@ -84,13 +66,13 @@ export function resolveConfigValue(config, env) {
 /**
  * Read the stored `api_key` credential for a provider from `auth.json`.
  *
- * Uses Pi's own reader through the package's public export, so `auth.json`
- * parsing (including its file lock and BOM handling) stays Pi's concern; a plain
- * JSON read is the fallback for a Pi version that does not export it.
+ * Read directly rather than through Pi's exported `readStoredCredential`: that is
+ * the same plain read of the same file, with no value resolution, so importing it
+ * would add a second path that a test here can never exercise.
  */
-export async function readStoredApiKey(providerId, options = {}) {
+export function readStoredApiKey(providerId, options = {}) {
   const authPath = options.authPath ?? authJsonPath();
-  const credential = await readCredential(providerId, authPath);
+  const credential = readCredential(providerId, authPath);
 
   if (!credential) {
     return { reason: `no "${providerId}" credential in ${authPath}` };
@@ -114,31 +96,10 @@ export async function readStoredApiKey(providerId, options = {}) {
   return { key, source: authPath };
 }
 
-let storedCredentialReader;
-
-async function readCredential(providerId, authPath) {
-  if (storedCredentialReader === undefined) {
-    storedCredentialReader = await loadStoredCredentialReader();
-  }
-  if (storedCredentialReader) {
-    return storedCredentialReader(providerId, authPath);
-  }
-  return readCredentialFromFile(providerId, authPath);
-}
-
-async function loadStoredCredentialReader() {
+/** `auth.json` holds one credential per provider id. */
+function readCredential(providerId, authPath) {
   try {
-    const pi = await import("@earendil-works/pi-coding-agent");
-    return typeof pi.readStoredCredential === "function" ? pi.readStoredCredential : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Fallback reader: `auth.json` holds one credential per provider id. */
-function readCredentialFromFile(providerId, authPath) {
-  try {
-    const data = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+    const data = JSON.parse(stripBom(fs.readFileSync(authPath, "utf-8")));
     if (!data || typeof data !== "object") {
       return undefined;
     }
@@ -147,6 +108,10 @@ function readCredentialFromFile(providerId, authPath) {
   } catch {
     return undefined;
   }
+}
+
+function stripBom(text) {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
 /** Execute a `!command` value, caching the result for the process lifetime. */

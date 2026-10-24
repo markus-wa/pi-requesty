@@ -42,17 +42,11 @@ function readModelsJson() {
 }
 
 /**
- * Resolve the key used for model discovery, following Pi's own order: a stored
- * `auth.json` credential first, then `providers.requesty.apiKey` in models.json.
- *
- * Either value may be a `!command`, a `$VAR` reference, or a literal, so
- *
- *   { "requesty": { "type": "api_key", "key": "!secret-tool lookup requesty api-key" } }
- *
- * works without writing the key to disk.
+ * The key for model discovery: a stored `auth.json` credential first, then
+ * `providers.requesty.apiKey`. Either may be a `!command`, `$VAR` or a literal.
  */
-async function resolveRequestyKey(provider, options = {}) {
-  const stored = await readStoredApiKey(PROVIDER, options);
+function resolveRequestyKey(provider, options = {}) {
+  const stored = readStoredApiKey(PROVIDER, options);
   if (stored.key) {
     return stored;
   }
@@ -66,13 +60,11 @@ async function resolveRequestyKey(provider, options = {}) {
 }
 
 /**
- * Collect the provider settings and the key used to reach `<baseUrl>/models`.
- *
- * `provider` is returned unchanged apart from `name`/`baseUrl` defaults, so a
- * key resolved from `auth.json` is never copied into the registered provider or
- * written back to `models.json`: Pi resolves credentials for inference itself.
+ * The provider settings plus the key used to reach `<baseUrl>/models`. A key that
+ * came from `auth.json` stays out of `provider`, so it cannot reach the registered
+ * provider or a `models.json` write.
  */
-async function getRequestyConfig(options = {}) {
+function getRequestyConfig(options = {}) {
   const data = readModelsJson();
   const provider = data.providers[PROVIDER] ?? {};
 
@@ -82,7 +74,7 @@ async function getRequestyConfig(options = {}) {
     typeof provider.baseUrl === "string" && provider.baseUrl.length > 0 ? provider.baseUrl : DEFAULT_BASE_URL,
   );
 
-  const resolved = await resolveRequestyKey(provider, options);
+  const resolved = resolveRequestyKey(provider, options);
 
   return {
     data,
@@ -189,7 +181,7 @@ export default async function (pi) {
       ctx.ui.setStatus("requesty-models-sync", "Discovering Requesty models...");
 
       try {
-        const { data, provider, key, keySource, keyProblem } = await getRequestyConfig();
+        const { data, provider, key, keySource, keyProblem } = getRequestyConfig();
 
         if (!key) {
           ctx.ui.notify(`No Requesty credential available.\n\n${keyProblem}\n\n${KEY_HELP}`, "error");
@@ -211,7 +203,7 @@ export default async function (pi) {
   });
 
   try {
-    const { provider, key } = await getRequestyConfig();
+    const { provider, key } = getRequestyConfig();
 
     // No credential is not a failure: Pi resolves credentials for inference
     // itself, and models already listed in models.json keep working. Discovery

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 
 // The extension resolves the agent directory once per call, so pointing
 // PI_CODING_AGENT_DIR at a fixture directory keeps every test off the real
@@ -17,6 +17,7 @@ const { default: requestyExtension } = await import("../requesty.js");
 
 const AUTH_PATH = path.join(agentDir, "auth.json");
 const MODELS_PATH = path.join(agentDir, "models.json");
+const KEYRING = { type: "api_key", key: "!printf sk-from-keyring" };
 
 function writeAuthJson(value) {
   fs.writeFileSync(AUTH_PATH, JSON.stringify(value, null, 2));
@@ -58,8 +59,8 @@ function createContext() {
   };
 }
 
-/** Stub `fetch`, recording the discovery request instead of making it. */
-function stubFetch(models = [{ id: "policy/deepseek-v4.1-flash" }], failure) {
+/** Stub `fetch`, recording the request and answering (or failing) on demand. */
+function stubFetch({ models = [{ id: "policy/deepseek-v4.1-flash" }], failure, status = 200 } = {}) {
   const calls = [];
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -67,9 +68,13 @@ function stubFetch(models = [{ id: "policy/deepseek-v4.1-flash" }], failure) {
     if (failure) {
       throw failure;
     }
+    if (status !== 200) {
+      const statusText = status === 401 ? "Unauthorized" : "";
+      return { ok: false, status, statusText, json: async () => ({}) };
+    }
     return {
       ok: true,
-      status: 200,
+      status,
       statusText: "OK",
       json: async () => ({
         data: models.map((model) => ({
@@ -93,17 +98,37 @@ function stubFetch(models = [{ id: "policy/deepseek-v4.1-flash" }], failure) {
   };
 }
 
-/** Capture console.warn, so a silent startup can be asserted. */
-function captureWarnings() {
+/**
+ * Run the extension once against the given fixtures, capturing fetch and warns.
+ *
+ * `during` runs while the fetch stub is still installed, for tests that exercise
+ * the slash command rather than extension startup.
+ */
+async function runStartup(fetchOptions = {}, fixtures = {}, during) {
+  if (fixtures.auth) {
+    writeAuthJson({ requesty: fixtures.auth });
+  }
+  if (fixtures.models !== undefined) {
+    writeModelsJson(fixtures.models);
+  }
+
+  const fetchStub = stubFetch(fetchOptions);
   const warnings = [];
-  const original = console.warn;
+  const originalWarn = console.warn;
   console.warn = (...args) => warnings.push(args.join(" "));
-  return {
-    warnings,
-    restore() {
-      console.warn = original;
-    },
-  };
+  const pi = createPi();
+
+  try {
+    await requestyExtension(pi);
+    const result = { pi, calls: fetchStub.calls, warnings };
+    if (during) {
+      await during(result);
+    }
+    return result;
+  } finally {
+    fetchStub.restore();
+    console.warn = originalWarn;
+  }
 }
 
 beforeEach(() => {
@@ -112,40 +137,36 @@ beforeEach(() => {
   fs.rmSync(MODELS_PATH, { force: true });
 });
 
+afterEach(() => {
+  clearConfigValueCache();
+});
+
 after(() => {
   fs.rmSync(agentDir, { recursive: true, force: true });
 });
 
 describe("resolveConfigValue", () => {
-  it("runs a !command and uses its trimmed stdout", () => {
-    assert.equal(resolveConfigValue("!printf '  sk-from-secret-tool\\n'"), "sk-from-secret-tool");
-  });
+  const cases = [
+    ["a !command's trimmed stdout", "!printf '  sk-from-secret-tool\\n'", {}, "sk-from-secret-tool"],
+    ["an unset variable", "$PI_REQUESTY_DEFINITELY_UNSET", {}, undefined],
+    ["a failing command", "!exit 1", {}, undefined],
+    ["a command that does not exist", "!command-that-does-not-exist", {}, undefined],
+    ["$NAME", "$REQUESTY_API_KEY", { REQUESTY_API_KEY: "sk-env" }, "sk-env"],
+    ["${NAME}", "${REQUESTY_API_KEY}", { REQUESTY_API_KEY: "sk-env" }, "sk-env"],
+    ["a variable inside a literal", "prefix-$REQUESTY_API_KEY-suffix", { REQUESTY_API_KEY: "sk-env" }, "prefix-sk-env-suffix"],
+    ["a variable name that is longer than the one set", "$REQUESTY_API_KEY_OTHER", { REQUESTY_API_KEY: "sk-env" }, undefined],
+    ["$$ as a literal $", "sk-$$literal", {}, "sk-$literal"],
+    ["$! as a literal !", "sk-$!", {}, "sk-!"],
+    ["a literal", "rqsty-sk-abc", {}, "rqsty-sk-abc"],
+    ["an empty value", "", {}, undefined],
+    ["undefined", undefined, {}, undefined],
+  ];
 
-  it("resolves an unset variable or failing command to undefined", () => {
-    assert.equal(resolveConfigValue("$PI_REQUESTY_DEFINITELY_UNSET"), undefined);
-    assert.equal(resolveConfigValue("!exit 1"), undefined);
-    assert.equal(resolveConfigValue("!command-that-does-not-exist"), undefined);
-  });
-
-  it("interpolates $NAME and ${NAME}", () => {
-    const env = { REQUESTY_API_KEY: "sk-env" };
-    assert.equal(resolveConfigValue("$REQUESTY_API_KEY", env), "sk-env");
-    assert.equal(resolveConfigValue("${REQUESTY_API_KEY}", env), "sk-env");
-    assert.equal(resolveConfigValue("prefix-$REQUESTY_API_KEY-suffix", env), "prefix-sk-env-suffix");
-    assert.equal(resolveConfigValue("$REQUESTY_API_KEY_OTHER", env), undefined);
-  });
-
-  it("unescapes $$ and $!", () => {
-    assert.equal(resolveConfigValue("sk-$$literal", {}), "sk-$literal");
-    assert.equal(resolveConfigValue("!not-a-command", {}), undefined);
-    assert.equal(resolveConfigValue("sk-$!", {}), "sk-!");
-  });
-
-  it("passes a literal through", () => {
-    assert.equal(resolveConfigValue("rqsty-sk-abc", {}), "rqsty-sk-abc");
-    assert.equal(resolveConfigValue("", {}), undefined);
-    assert.equal(resolveConfigValue(undefined, {}), undefined);
-  });
+  for (const [name, config, env, expected] of cases) {
+    it(`resolves ${name}`, () => {
+      assert.equal(resolveConfigValue(config, env), expected);
+    });
+  }
 
   it("identifies command values", () => {
     assert.equal(isCommandConfigValue("!secret-tool lookup requesty api-key"), true);
@@ -162,235 +183,156 @@ describe("resolveConfigValue", () => {
 });
 
 describe("readStoredApiKey", () => {
-  it("resolves a secret-manager command from auth.json", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    const result = await readStoredApiKey("requesty");
-    assert.deepEqual(result, { key: "sk-from-keyring", source: AUTH_PATH });
+  it("resolves a secret-manager command from auth.json", () => {
+    writeAuthJson({ requesty: KEYRING });
+    assert.deepEqual(readStoredApiKey("requesty"), { key: "sk-from-keyring", source: AUTH_PATH });
   });
 
-  it("resolves a literal and a $VAR key from auth.json", async () => {
+  it("resolves a literal and a $VAR key from auth.json", () => {
     writeAuthJson({ requesty: { type: "api_key", key: "rqsty-sk-literal" } });
-    assert.equal((await readStoredApiKey("requesty")).key, "rqsty-sk-literal");
+    assert.equal(readStoredApiKey("requesty").key, "rqsty-sk-literal");
 
     writeAuthJson({ requesty: { type: "api_key", key: "$REQUESTY_TEST_KEY" } });
     clearConfigValueCache();
-    assert.equal((await readStoredApiKey("requesty", { env: { REQUESTY_TEST_KEY: "sk-env" } })).key, "sk-env");
+    assert.equal(readStoredApiKey("requesty", { env: { REQUESTY_TEST_KEY: "sk-env" } }).key, "sk-env");
   });
 
-  it("explains what is missing instead of throwing", async () => {
-    assert.match((await readStoredApiKey("requesty")).reason, /no "requesty" credential/);
+  const reasons = [
+    ["a missing credential", undefined, /no "requesty" credential/],
+    ["an oauth credential", { type: "oauth", access: "token" }, /is of type "oauth"/],
+    ["a credential without a key", { type: "api_key" }, /has no key/],
+    ["a key whose command fails", { type: "api_key", key: "!exit 1" }, /did not resolve/],
+    ["an unreadable auth.json", "not json", /no "requesty" credential/],
+  ];
 
-    writeAuthJson({ requesty: { type: "oauth", access: "token" } });
-    assert.match((await readStoredApiKey("requesty")).reason, /is of type "oauth"/);
-
-    writeAuthJson({ requesty: { type: "api_key" } });
-    assert.match((await readStoredApiKey("requesty")).reason, /has no key/);
-
-    writeAuthJson({ requesty: { type: "api_key", key: "!exit 1" } });
-    assert.match((await readStoredApiKey("requesty")).reason, /did not resolve/);
-  });
-
-  it("ignores an unreadable auth.json", async () => {
-    fs.writeFileSync(AUTH_PATH, "not json");
-    assert.match((await readStoredApiKey("requesty")).reason, /no "requesty" credential/);
-  });
+  for (const [name, credential, pattern] of reasons) {
+    it(`explains ${name} instead of throwing`, () => {
+      if (credential === "not json") {
+        fs.writeFileSync(AUTH_PATH, credential);
+      } else if (credential) {
+        writeAuthJson({ requesty: credential });
+      }
+      assert.match(readStoredApiKey("requesty").reason, pattern);
+    });
+  }
 });
 
 describe("startup discovery", () => {
-  it("uses the auth.json command as the bearer token", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    const fetchStub = stubFetch();
-    const pi = createPi();
+  const sources = [
+    ["the auth.json command", { auth: KEYRING }, "Bearer sk-from-keyring"],
+    [
+      "auth.json over a models.json apiKey",
+      { auth: KEYRING, models: { providers: { requesty: { apiKey: "sk-from-models-json" } } } },
+      "Bearer sk-from-keyring",
+    ],
+    [
+      "a models.json literal apiKey",
+      { models: { providers: { requesty: { apiKey: "sk-from-models-json" } } } },
+      "Bearer sk-from-models-json",
+    ],
+    [
+      "a models.json !command apiKey",
+      { models: { providers: { requesty: { apiKey: "!printf sk-from-models-command" } } } },
+      "Bearer sk-from-models-command",
+    ],
+  ];
 
-    try {
-      await requestyExtension(pi);
-    } finally {
-      fetchStub.restore();
-    }
+  for (const [name, fixtures, expected] of sources) {
+    it(`uses ${name} as the bearer token`, async () => {
+      const { calls } = await runStartup({}, fixtures);
 
-    assert.equal(fetchStub.calls.length, 1);
-    assert.equal(fetchStub.calls[0].url, "https://router.requesty.ai/v1/models");
-    assert.equal(fetchStub.calls[0].authorization, "Bearer sk-from-keyring");
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].url, "https://router.requesty.ai/v1/models");
+      assert.equal(calls[0].authorization, expected);
+    });
+  }
+
+  it("registers the discovered models without the key that came from auth.json", async () => {
+    const { pi } = await runStartup({}, { auth: KEYRING });
+
     assert.equal(pi.providers.get("requesty").models.length, 1);
-  });
-
-  it("prefers the auth.json credential over models.json apiKey", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    writeModelsJson({ providers: { requesty: { apiKey: "sk-from-models-json" } } });
-    const fetchStub = stubFetch();
-
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      fetchStub.restore();
-    }
-
-    assert.equal(fetchStub.calls[0].authorization, "Bearer sk-from-keyring");
-  });
-
-  it("falls back to a models.json apiKey, including a command value", async () => {
-    writeModelsJson({ providers: { requesty: { apiKey: "sk-from-models-json" } } });
-    let fetchStub = stubFetch();
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      fetchStub.restore();
-    }
-    assert.equal(fetchStub.calls[0].authorization, "Bearer sk-from-models-json");
-
-    writeModelsJson({ providers: { requesty: { apiKey: "!printf sk-from-models-command" } } });
-    fetchStub = stubFetch();
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      fetchStub.restore();
-    }
-    assert.equal(fetchStub.calls[0].authorization, "Bearer sk-from-models-command");
-  });
-
-  it("keeps the registered provider free of a key that came from auth.json", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    const fetchStub = stubFetch();
-    const pi = createPi();
-
-    try {
-      await requestyExtension(pi);
-    } finally {
-      fetchStub.restore();
-    }
-
     assert.equal(pi.providers.get("requesty").apiKey, undefined);
   });
 
   it("stays silent and off the network when no credential is configured", async () => {
-    const fetchStub = stubFetch();
-    const warnings = captureWarnings();
-    const pi = createPi();
+    const { pi, calls, warnings } = await runStartup();
 
-    try {
-      await requestyExtension(pi);
-    } finally {
-      fetchStub.restore();
-      warnings.restore();
-    }
-
-    assert.equal(fetchStub.calls.length, 0);
-    assert.deepEqual(warnings.warnings, []);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(warnings, []);
     assert.equal(pi.providers.size, 0);
   });
 
   it("still warns when a configured credential cannot discover models", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    const warnings = captureWarnings();
-    const original = globalThis.fetch;
-    globalThis.fetch = async () => ({ ok: false, status: 401, statusText: "Unauthorized" });
+    const { warnings } = await runStartup({ status: 401 }, { auth: KEYRING });
 
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      globalThis.fetch = original;
-      warnings.restore();
-    }
-
-    assert.match(warnings.warnings.join("\n"), /HTTP 401/);
+    assert.match(warnings.join("\n"), /HTTP 401/);
   });
 
   it("bounds the discovery request so an unresponsive endpoint cannot block startup", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    const fetchStub = stubFetch();
+    const { calls } = await runStartup({}, { auth: KEYRING });
 
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      fetchStub.restore();
-    }
-
-    assert.equal(fetchStub.calls[0].signal instanceof AbortSignal, true);
+    assert.equal(calls[0].signal instanceof AbortSignal, true);
   });
 
   it("reports a discovery timeout instead of hanging", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
     const timeout = Object.assign(new Error("The operation was aborted due to timeout"), {
       name: "TimeoutError",
     });
-    const fetchStub = stubFetch(undefined, timeout);
-    const warnings = captureWarnings();
+    const { warnings } = await runStartup({ failure: timeout }, { auth: KEYRING });
 
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      fetchStub.restore();
-      warnings.restore();
-    }
-
-    assert.match(warnings.warnings.join("\n"), /no response from https:\/\/router\.requesty\.ai\/v1\/models within 10000ms/);
+    assert.match(warnings.join("\n"), /no response from https:\/\/router\.requesty\.ai\/v1\/models within 10000ms/);
   });
 
-  it("refuses to proceed past a malformed models.json", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    writeModelsJson({ providers: "not-an-object" });
-    const fetchStub = stubFetch();
-    const warnings = captureWarnings();
+  const malformed = [
+    ["providers as a string", { providers: "not-an-object" }, /does not define providers as an object/],
+    ["providers as an array", { providers: [] }, /does not define providers as an object/],
+    ["a provider entry that is not an object", { providers: { requesty: "nope" } }, /providers\.requesty in .* is not an object/],
+  ];
 
-    try {
-      await requestyExtension(createPi());
-    } finally {
-      fetchStub.restore();
-      warnings.restore();
-    }
+  for (const [name, models, pattern] of malformed) {
+    it(`refuses to discover with ${name} and makes no request`, async () => {
+      const { calls, warnings } = await runStartup({}, { auth: KEYRING, models });
 
-    assert.equal(fetchStub.calls.length, 0);
-    assert.match(warnings.warnings.join("\n"), /does not define providers as an object/);
-  });
+      assert.equal(calls.length, 0);
+      assert.match(warnings.join("\n"), pattern);
+    });
+  }
 });
 
 describe("/requesty-models-sync", () => {
-  async function runCommand() {
-    const pi = createPi();
-    const fetchStub = stubFetch();
-    const warnings = captureWarnings();
-    try {
-      await requestyExtension(pi);
-      const context = createContext();
-      await pi.commands.get("requesty-models-sync").handler("", context);
-      return { context, pi };
-    } finally {
-      fetchStub.restore();
-      warnings.restore();
-    }
+  async function runCommand(fixtures = { auth: KEYRING }) {
+    const context = createContext();
+    const { pi } = await runStartup({}, fixtures, async (started) => {
+      await started.pi.commands.get("requesty-models-sync").handler("", context);
+    });
+    return { context, pi };
   }
 
-  it("leaves a malformed models.json untouched", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    writeModelsJson({ providers: [] });
-    const before = fs.readFileSync(MODELS_PATH, "utf8");
+  const malformed = [
+    ["providers as an array", { providers: [] }, /does not define providers as an object/],
+    ["a provider entry that is not an object", { providers: { requesty: "nope" } }, /providers\.requesty in .* is not an object/],
+  ];
 
-    const { context } = await runCommand();
+  for (const [name, models, pattern] of malformed) {
+    it(`reports ${name} and leaves the file untouched`, async () => {
+      writeModelsJson(models);
+      const before = fs.readFileSync(MODELS_PATH, "utf8");
 
-    assert.equal(fs.readFileSync(MODELS_PATH, "utf8"), before);
-    assert.equal(context.notifications.at(-1).level, "error");
-    assert.match(context.notifications.at(-1).message, /does not define providers as an object/);
-  });
+      const { context } = await runCommand();
 
-  it("rejects a provider entry that is not an object", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
-    writeModelsJson({ providers: { requesty: "nope" } });
-    const before = fs.readFileSync(MODELS_PATH, "utf8");
-
-    const { context } = await runCommand();
-
-    assert.equal(fs.readFileSync(MODELS_PATH, "utf8"), before);
-    assert.match(context.notifications.at(-1).message, /providers\.requesty in .* is not an object/);
-  });
+      assert.equal(fs.readFileSync(MODELS_PATH, "utf8"), before);
+      assert.equal(context.notifications.at(-1).level, "error");
+      assert.match(context.notifications.at(-1).message, pattern);
+    });
+  }
 
   it("writes discovered models without persisting a keyring key", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
     const { context } = await runCommand();
 
-    const written = JSON.parse(fs.readFileSync(MODELS_PATH, "utf8"));
-    assert.equal(written.providers.requesty.models.length, 1);
-    assert.equal(written.providers.requesty.apiKey, undefined);
-    assert.equal(fs.readFileSync(MODELS_PATH, "utf8").includes("sk-from-keyring"), false);
+    const written = fs.readFileSync(MODELS_PATH, "utf8");
+    assert.equal(JSON.parse(written).providers.requesty.models.length, 1);
+    assert.equal(JSON.parse(written).providers.requesty.apiKey, undefined);
+    assert.equal(written.includes("sk-from-keyring"), false);
     assert.match(context.notifications.at(-1).message, /using the key from/);
   });
 
@@ -398,17 +340,18 @@ describe("/requesty-models-sync", () => {
     writeModelsJson({
       providers: { requesty: { baseUrl: "https://example.test/v1", apiKey: "sk-from-models-json", custom: true } },
     });
+
     await runCommand();
 
-    const written = JSON.parse(fs.readFileSync(MODELS_PATH, "utf8"));
-    assert.equal(written.providers.requesty.baseUrl, "https://example.test/v1");
-    assert.equal(written.providers.requesty.custom, true);
-    assert.equal(written.providers.requesty.apiKey, "sk-from-models-json");
-    assert.equal(written.providers.requesty.models.length, 1);
+    const { requesty } = JSON.parse(fs.readFileSync(MODELS_PATH, "utf8")).providers;
+    assert.equal(requesty.baseUrl, "https://example.test/v1");
+    assert.equal(requesty.custom, true);
+    assert.equal(requesty.apiKey, "sk-from-models-json");
+    assert.equal(requesty.models.length, 1);
   });
 
   it("explains both accepted key locations when nothing is configured", async () => {
-    const { context } = await runCommand();
+    const { context } = await runCommand({});
 
     const message = context.notifications.at(-1);
     assert.equal(message.level, "error");
@@ -419,13 +362,10 @@ describe("/requesty-models-sync", () => {
   });
 
   it("creates models.json when it does not exist", async () => {
-    writeAuthJson({ requesty: { type: "api_key", key: "!printf sk-from-keyring" } });
     assert.equal(fs.existsSync(MODELS_PATH), false);
+
     await runCommand();
+
     assert.equal(JSON.parse(fs.readFileSync(MODELS_PATH, "utf8")).providers.requesty.models.length, 1);
   });
-});
-
-afterEach(() => {
-  clearConfigValueCache();
 });
