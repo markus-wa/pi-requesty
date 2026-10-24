@@ -86,7 +86,31 @@ async function getRequestyConfig(options = {}) {
   };
 }
 
-async function discoverModels({ baseUrl, apiKey }) {
+/**
+ * Price one catalog field, keeping the price already in `models.json` when the
+ * catalog omits the field.
+ *
+ * A routing alias such as `policy/deepseek-v4.1-flash` is not a model Requesty
+ * serves, so its catalog entry carries no `input_price`/`output_price`. Turning
+ * that absence into `0` registered the alias at no cost, and because a
+ * registered provider shadows `models.json`, an operator's own rate for it
+ * could never take effect. An explicit catalog number still wins, zero
+ * included.
+ */
+function priceOrPrevious(catalogPrice, previousPrice) {
+  if (catalogPrice != null) {
+    return pricePerMillionTokens(catalogPrice);
+  }
+  return typeof previousPrice === "number" && Number.isFinite(previousPrice) ? previousPrice : 0;
+}
+
+async function discoverModels({ baseUrl, apiKey, previousModels = [] }) {
+  const previousById = new Map(
+    (Array.isArray(previousModels) ? previousModels : [])
+      .filter((model) => model && typeof model.id === "string")
+      .map((model) => [model.id, model]),
+  );
+
   const response = await fetch(`${baseUrl}/models`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
@@ -102,20 +126,24 @@ async function discoverModels({ baseUrl, apiKey }) {
 
   return payload.data
     .filter((model) => model && typeof model.id === "string" && model.id.length > 0)
-    .map((model) => ({
-      id: model.id,
-      name: typeof model.name === "string" && model.name.length > 0 ? model.name : model.id,
-      reasoning: model.supports_reasoning === true,
-      input: model.supports_vision === true ? ["text", "image"] : ["text"],
-      cost: {
-        input: pricePerMillionTokens(model.input_price),
-        output: pricePerMillionTokens(model.output_price),
-        cacheRead: pricePerMillionTokens(model.cached_price),
-        cacheWrite: pricePerMillionTokens(model.caching_price),
-      },
-      contextWindow: model.context_window || DEFAULT_CONTEXT_WINDOW,
-      maxTokens: model.max_output_tokens || DEFAULT_MAX_TOKENS,
-    }));
+    .map((model) => {
+      const previousCost = previousById.get(model.id)?.cost;
+
+      return {
+        id: model.id,
+        name: typeof model.name === "string" && model.name.length > 0 ? model.name : model.id,
+        reasoning: model.supports_reasoning === true,
+        input: model.supports_vision === true ? ["text", "image"] : ["text"],
+        cost: {
+          input: priceOrPrevious(model.input_price, previousCost?.input),
+          output: priceOrPrevious(model.output_price, previousCost?.output),
+          cacheRead: priceOrPrevious(model.cached_price, previousCost?.cacheRead),
+          cacheWrite: priceOrPrevious(model.caching_price, previousCost?.cacheWrite),
+        },
+        contextWindow: model.context_window || DEFAULT_CONTEXT_WINDOW,
+        maxTokens: model.max_output_tokens || DEFAULT_MAX_TOKENS,
+      };
+    });
 }
 
 function pricePerMillionTokens(value) {
@@ -176,7 +204,11 @@ export default async function (pi) {
           return;
         }
 
-        const models = await discoverModels({ baseUrl: provider.baseUrl, apiKey: key });
+        const models = await discoverModels({
+          baseUrl: provider.baseUrl,
+          apiKey: key,
+          previousModels: provider.models,
+        });
         updateModelsJson(data, models);
         ctx.ui.notify(
           `Discovered ${models.length} Requesty model(s) using the key from ${keySource}. Run /reload to use models.json changes.`,
@@ -200,7 +232,11 @@ export default async function (pi) {
       return;
     }
 
-    const models = await discoverModels({ baseUrl: provider.baseUrl, apiKey: key });
+    const models = await discoverModels({
+      baseUrl: provider.baseUrl,
+      apiKey: key,
+      previousModels: provider.models,
+    });
 
     if (models.length > 0) {
       pi.registerProvider(PROVIDER, {
